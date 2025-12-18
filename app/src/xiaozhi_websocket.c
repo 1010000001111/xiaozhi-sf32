@@ -42,6 +42,7 @@
 
 #define MAX_WSOCK_HDR_LEN 4096
 #define WEBSOC_RECONNECT 4
+#define SPEAKING_THRESHOLD_MS (5 * 60 * 1000) // 小智讲话时间阈值 
 
 extern BOOL g_pan_connected;
 extern xz_audio_t *thiz;
@@ -83,7 +84,7 @@ static const char *hello_message =
 static lv_obj_t *countdown_screen = NULL;
 static rt_thread_t countdown_thread = RT_NULL;
 static bool  g_ota_verified = false;
-uint8_t shutdown_state = 1; 
+bool shutdown_state = true;
 
 typedef struct
 {
@@ -100,6 +101,9 @@ typedef struct
 
 static activation_context_t g_activation_context;
 static websocket_context_t g_websocket_context;
+static rt_tick_t g_speaking_start_tick = 0;  // 讲话开始时间
+static rt_tick_t g_total_speaking_time = 0;  // 累计讲话时间
+static bool g_is_speaking = false;           // 是否正在讲话
 
 
 void parse_helLo(const u8_t *data, u16_t len);
@@ -320,6 +324,11 @@ static void xz_button_event_handler(int32_t pin, button_action_t action)
         lv_obj_t *now_screen = lv_screen_active();
         rt_kprintf("pressed\r\n");
         rt_kprintf("按键->对话");
+
+        // 检查是否弹窗显示中
+
+        xiaozhi_ui_update_confirm_button_event(1); // 模拟点击更新按钮
+
         if (now_screen == standby_screen)
         {
             ui_switch_to_xiaozhi_screen();
@@ -380,6 +389,9 @@ static void xz_button2_event_handler(int32_t pin, button_action_t action)
     {
 
         rt_kprintf("xz_button2_event_handler - pressed\n");
+
+        xiaozhi_ui_update_confirm_button_event(0); // 模拟点击取消按钮
+
     }
     else if (action == BUTTON_LONG_PRESSED)
     {
@@ -397,7 +409,7 @@ static void xz_button2_event_handler(int32_t pin, button_action_t action)
         {
             rt_sem_release(g_activation_context.sem);
         }
-        shutdown_state = 0;
+        shutdown_state = false;
         gui_pm_fsm(GUI_PM_ACTION_WAKEUP); // 唤醒设备
         rt_thread_mdelay(100);
         rt_mb_send(g_ui_task_mb, UI_EVENT_SHUTDOWN);
@@ -533,10 +545,32 @@ void parse_helLo(const u8_t *data, u16_t len)
                 web_g_state = kDeviceStateSpeaking;
                 xz_speaker(1); // 打开扬声器
                 xiaozhi_ui_chat_status("讲话中...");
+
+                // 开始累计讲话时间
+                g_is_speaking = true;
+                g_speaking_start_tick = rt_tick_get();
             }
         }
         else if (strcmp(state, "stop") == 0)
-        {
+        {           
+            // 计算本次讲话时间并累加
+            if (g_is_speaking) 
+            {
+                rt_tick_t current_tick = rt_tick_get();
+                rt_tick_t speaking_duration = current_tick - g_speaking_start_tick;
+                g_total_speaking_time += speaking_duration;
+                g_is_speaking = false;
+
+                rt_kprintf("xiaozhi total_speaking_time: %d ticks\n", g_total_speaking_time);
+                // 检查是否达到5分钟阈值
+                if (g_total_speaking_time >= rt_tick_from_millisecond(SPEAKING_THRESHOLD_MS)) 
+                {
+                    rt_kprintf("Speaking time reached 5 minutes, reinitializing audio\n");
+                    g_total_speaking_time = 0; // 重置累计时间
+                    xiaozhi_ui_reinit_audio();
+                }
+            }
+            
             web_g_state = kDeviceStateIdle;
             xz_speaker(0); // 关闭扬声器
             xiaozhi_ui_chat_status("待命中...");

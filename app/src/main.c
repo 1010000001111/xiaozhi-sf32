@@ -11,6 +11,7 @@
 #include "string.h"
 #include "xiaozhi_websocket.h"
 #include "./iot/iot_c_api.h"
+#include <stdbool.h>
 #ifdef BSP_USING_PM
     #include "gui_app_pm.h"
 #endif // BSP_USING_PM
@@ -31,6 +32,8 @@
 #include "bt_env.h"
 #include "ulog.h"
 #include "drv_gpio.h"
+#include "battery_calculator.h"
+#include "bt_pan_ota.h"
 /* Common functions for RT-Thread based platform
  * -----------------------------------------------*/
 /**
@@ -78,6 +81,8 @@ uint8_t Initiate_disconnection_flag = 0;//蓝牙主动断开标志
 rt_mailbox_t g_battery_mb;
 bool g_skip_startup = true; 
 bool low_battery_shutdown_triggered = true;
+bool lowpower_shutdown_state = true;
+bool g_low_power_mode = false;
 
 static rt_timer_t s_reconnect_timer = NULL;
 static rt_timer_t s_sleep_timer = NULL;
@@ -86,6 +91,8 @@ static uint8_t g_sleep_enter_flag = 0;    // 进入睡眠标志位
 // UI线程和battery线程控制块
 static struct rt_thread xiaozhi_ui_thread;
 static struct rt_thread battery_thread;
+// 最新版本信息
+extern char latest_version[32];
 
 
 //ui线程
@@ -106,6 +113,8 @@ L2_RET_BSS_SECT_END
 static uint32_t
     battery_thread_stack[BATTERY_THREAD_STACK_SIZE / sizeof(uint32_t)] L2_RET_BSS_SECT(battery_thread_stack);
 #endif
+
+
 
 #ifdef BSP_USING_BOARD_SF32LB52_XTY_AI
 static rt_timer_t s_pulse_encoder_timer = NULL;
@@ -195,6 +204,25 @@ static void battery_level_task(void *parameter)
         rt_kprintf("Failed to create mailbox g_battery_mb\n");
         return;
     }
+    uint8_t battery_percentage = 0;
+    uint8_t shutdown_battery_percentage = 0; 
+    // 初始化电池计算器
+    battery_calculator_t battery_calc;
+    battery_calculator_config_t calc_config = 
+    {
+        .charging_table = charging_curve_table,
+        .charging_table_size = charging_curve_table_size,
+        .discharging_table = discharge_curve_table,
+        .discharging_table_size = discharge_curve_table_size,
+        .charge_filter_threshold = 50,      // 充电滤波阈值
+        .discharge_filter_threshold = 30,   // 放电滤波阈值
+        .filter_count = 3,                   // 滤波计数阈值
+        .secondary_filter_enabled = true,    // 启用二级滤波
+        .secondary_filter_weight_pre = 90,   // 二级滤波前电压权重
+        .secondary_filter_weight_cur = 10    // 二级滤波当前电压权重
+    };
+    
+    battery_calculator_init(&battery_calc, &calc_config);
     rt_uint8_t current_status;
     while (1)
     {
@@ -208,30 +236,44 @@ static void battery_level_task(void *parameter)
             LOG_E("Failed to enable ADC for battery read\n");
             return;
         }
-        rt_uint32_t battery_level =
-            rt_adc_read((rt_adc_device_t)battery_device, read_arg.channel);
+        rt_thread_mdelay(300);
+        rt_uint32_t battery_level = rt_adc_read((rt_adc_device_t)battery_device, read_arg.channel);
+        rt_kprintf("battery_level: %d\n", battery_level);
         rt_adc_disable((rt_adc_device_t)battery_device, read_arg.channel);
-
-        // 获取到的是电池电压，单位是mV
-        // 假设电池电压范围是3.6V到4.2V，对应的电量范围是0%到100%
-        uint32_t battery_percentage = 0;
-        if (battery_level < 36000)
+        if(g_low_power_mode)
         {
-            battery_percentage = 0; // 小于3.6V，电量为0
-        }
-        else if (battery_level > 42000)
-        {
-            battery_percentage = 100; // 大于4.2V，电量为100
+#ifdef BSP_USING_BOARD_SF32LB52_LCHSPI_ULP
+            BSP_GPIO_Set(26, 1, 1);
+            HAL_PIN_Set(PAD_PA26, GPIO_A26, PIN_PULLUP, 1);
+            HAL_PIN_Set(PAD_PA10, I2C2_SCL, PIN_PULLUP, 1);
+            HAL_PIN_Set(PAD_PA11, I2C2_SDA, PIN_PULLUP, 1);
+            rt_thread_mdelay(10);
+#endif
+            battery_percentage = battery_calculator_get_percent(
+                &battery_calc, 
+                battery_level
+            );
+#ifdef BSP_USING_BOARD_SF32LB52_LCHSPI_ULP
+            BSP_GPIO_Set(26, 0, 1);
+            HAL_PIN_Set(PAD_PA26, GPIO_A26, PIN_NOPULL, 1);
+            HAL_PIN_Set(PAD_PA10, GPIO_A10, PIN_PULLDOWN, 1);
+            HAL_PIN_Set(PAD_PA11, GPIO_A11, PIN_PULLDOWN, 1);
+#endif
         }
         else
         {
-            // 线性插值计算电量百分比
-            battery_percentage = ((battery_level - 36000) * 100) / (42000 - 36000);
+            battery_percentage = battery_calculator_get_percent(
+                &battery_calc, 
+                battery_level
+            );
         }
 
         rt_mb_send(g_battery_mb, battery_percentage);
         current_status = rt_pin_read(CHARGE_DETECT_PIN);
-        rt_kprintf("battery_percentage: %d, current_status: %d \n", battery_percentage, current_status);
+        rt_kprintf("battery_percentage: %d, current_status: %d: %d \n", battery_percentage, current_status);
+#ifdef LOW_POWER_NO_SHUTDOWN  //针对立创没有电池的板子
+
+#else
         //当电量低于阈值并且当前没有处于充电中并的时候
         if (battery_percentage < LOW_BATTERY_THRESHOLD && low_battery_shutdown_triggered && !current_status) 
         {
@@ -240,18 +282,21 @@ static void battery_level_task(void *parameter)
                now_screen, sleep_screen, standby_screen);
             low_battery_shutdown_triggered = false;
             rt_kprintf("Low battery ,shutdown\n");
-            // 发送消息到UI线程显示低电量关机页面
+            //发送消息到UI线程显示低电量关机页面
             if (g_ui_task_mb != RT_NULL) 
             {
                 if(now_screen == sleep_screen && now_screen != NULL)
                 {
+                    lowpower_shutdown_state = false;
                     gui_pm_fsm(GUI_PM_ACTION_WAKEUP); // 唤醒设备
+
                 }
                 
                 rt_thread_mdelay(100);
                 rt_mb_send(g_ui_task_mb, UI_EVENT_LOW_BATTERY_SHUTDOWN);
             }
         }
+#endif /* LOW_POWER_NO_SHUTDOWN */
         rt_thread_mdelay(5000);
     }
 }
@@ -617,28 +662,37 @@ MSH_CMD_EXPORT(Write_MAC, write mac);
 void check_low_power(void)
 {
     rt_device_t battery_device = rt_device_find("bat1");
-    if (battery_device) {
+    if (battery_device) 
+    {
         rt_adc_cmd_read_arg_t read_arg;
         read_arg.channel = 7;
         rt_adc_enable((rt_adc_device_t)battery_device, read_arg.channel);
+        rt_thread_mdelay(300);
         rt_uint32_t battery_level = rt_adc_read((rt_adc_device_t)battery_device, read_arg.channel);
         rt_adc_disable((rt_adc_device_t)battery_device, read_arg.channel);
         
-        uint32_t battery_percentage = 0;
-        if (battery_level < 36000) {
-            battery_percentage = 0;
-        } else if (battery_level > 42000) {
-            battery_percentage = 100;
-        } else {
-            battery_percentage = ((battery_level - 36000) * 100) / (42000 - 36000);
-        }
+
+        battery_calculator_t battery_calc;
+        battery_calculator_config_t calc_config = 
+        {
+            .charging_table = charging_curve_table,
+            .charging_table_size = charging_curve_table_size,
+            .discharging_table = discharge_curve_table,
+            .discharging_table_size = discharge_curve_table_size,
+            .charge_filter_threshold = 50,      // 充电滤波阈值
+            .discharge_filter_threshold = 30,   // 放电滤波阈值
+            .filter_count = 3                   // 滤波计数阈值
+        }; 
+        battery_calculator_init(&battery_calc, &calc_config);
         
-        // 检查充电状态
-        rt_pin_mode(44, PIN_MODE_INPUT);
-        uint8_t charge_status = rt_pin_read(44);
         
+        uint8_t battery_percentage = battery_calculator_get_percent(
+            &battery_calc, 
+            battery_level
+        );
+        rt_uint8_t charge_status = rt_pin_read(CHARGE_DETECT_PIN);
         rt_kprintf("Boot battery check: %d%%, charging: %d\n", battery_percentage, charge_status);
-        
+
         // 如果低电量且未充电，进入低电量关机流程
         if (battery_percentage < LOW_BATTERY_THRESHOLD && !charge_status) 
         {
@@ -653,25 +707,26 @@ void check_low_power(void)
                                              XIAOZHI_UI_THREAD_STACK_SIZE,
                                              30,
                                              10);
-            if (result == RT_EOK) {
+            if (result == RT_EOK) 
+            {
                 rt_thread_startup(&xiaozhi_ui_thread);
             }
             
             g_ui_task_mb = rt_mb_create("ui_mb", 8, RT_IPC_FLAG_FIFO);
             rt_thread_mdelay(2000);
-            if (g_ui_task_mb != RT_NULL) {
+            if (g_ui_task_mb != RT_NULL) 
+            {
                 rt_mb_send(g_ui_task_mb, UI_EVENT_LOW_BATTERY_WARNING);
             }
             
-            while (1) {
+            while (1) 
+            {
                 rt_thread_mdelay(1000);
-
             }
         }
         rt_kprintf("电量充足，正常开机\n");
     }
 }
-
 int main(void)
 {
     check_poweron_reason();
@@ -684,13 +739,18 @@ int main(void)
     }
     //初始化电池邮箱
     g_battery_mb = rt_mb_create("battery_level", 1, RT_IPC_FLAG_FIFO);
-    check_low_power();
+#ifdef LOW_POWER_NO_SHUTDOWN  //针对立创没有电池的板子
 
+#else
+    check_low_power();
+#endif /* LOW_POWER_NO_SHUTDOWN */
     rt_kprintf("Xiaozhi start!!!\n");
     audio_server_set_private_volume(AUDIO_TYPE_LOCAL_MUSIC, VOL_DEFAULE_LEVEL); // 设置音量 
     xz_set_lcd_brightness(LCD_BRIGHTNESS_DEFAULT);
     iot_initialize(); // Initialize iot
     xiaozhi_time_weather_init();// Initialize time and weather
+    //rt_pm_request(PM_SLEEP_MODE_IDLE);
+
 #ifdef XIAOZHI_USING_MQTT
 #else
     xz_ws_audio_init(); // 初始化音频
@@ -743,6 +803,9 @@ int main(void)
     {
         rt_kprintf("Failed to init battery thread\n");
     }
+
+
+
 #ifdef BSP_USING_BOARD_SF32LB52_XTY_AI
     if (pulse_encoder_init() != RT_EOK)
     {
@@ -809,7 +872,32 @@ int main(void)
             rt_thread_mdelay(2000);
             // 执行NTP与天气同步
             xiaozhi_time_weather();
-            //xiaozhi_ui_chat_output("连接小智中...");
+
+
+            // 先进行设备注册
+            int reg_result = register_device_with_server();
+            if (reg_result != 0) {
+                rt_kprintf("Device registration failed, continuing with default chip_id\n");
+                // 如果注册失败，可以使用默认chip_id或者采取其他措施
+            }
+            // 获取动态chip_id并构建查询URL
+            char* chip_id = get_client_id();
+            char* dynamic_ota_url = build_ota_query_url(chip_id);
+            rt_kprintf("Dynamic chip_id: %s\n", chip_id);
+            rt_kputs(dynamic_ota_url);
+            rt_kprintf("\n");
+            //执行版本信息查询
+            int result = dfu_pan_query_latest_version(dynamic_ota_url, VERSION, latest_version, sizeof(latest_version));
+            rt_kprintf("OTA query result: %d, latest version: %s\n", result, latest_version);
+            // 根据返回值判断是否有更新
+            BOOL needs_update = (result > 0) ? RT_TRUE : RT_FALSE;
+
+            if (needs_update) 
+            {
+                //弹窗提示版本
+                xiaozhi_ui_update_latest_version(latest_version);
+            } 
+
             xiaozhi_ui_standby_chat_output("请按键连接小智...");
             lv_display_trigger_activity(NULL);
 
@@ -902,6 +990,7 @@ int main(void)
             xiaozhi_ui_standby_chat_output("请重启");//待机画面
         }
 #endif
+        rt_kprintf("main while loop\r\n");
     }
     return 0;
 }
@@ -920,3 +1009,44 @@ static void pan_cmd(int argc, char **argv)
         bt_app_connect_pan_timeout_handle(NULL);
 }
 MSH_CMD_EXPORT(pan_cmd, Connect PAN to last paired device);
+
+static void dfu_pan_finish_xz_cmd(int argc, char **argv)
+{
+    dfu_pan_test_update_flags();
+}
+MSH_CMD_EXPORT(dfu_pan_finish_xz_cmd, OTA finish verification command);
+
+
+static void dfu_pan_print_files_xz_cmd(int argc, char **argv)
+{
+    dfu_pan_print_files();
+}
+MSH_CMD_EXPORT(dfu_pan_print_files_xz_cmd, Print OTA firmware files status);
+
+static void dfu_pan_check_dynamic_xz_cmd(int argc, char **argv)
+{
+    LOG_I("Checking for new firmware version with dynamic chip_id...");
+    
+    // 先注册设备
+    int reg_result = register_device_with_server();
+    if (reg_result != 0) {
+        LOG_W("Device registration failed");
+    }
+    
+    // 构建动态URL
+    char* chip_id = get_client_id();
+    char* dynamic_ota_url = build_ota_query_url(chip_id);
+    
+    // 查询最新版本
+    int result = dfu_pan_query_latest_version(dynamic_ota_url, VERSION, latest_version, sizeof(latest_version));
+    
+    // 根据返回值判断是否有更新
+    BOOL needs_update = (result > 0) ? RT_TRUE : RT_FALSE;
+    
+    if (needs_update) {
+        LOG_I("New firmware version %s available. Type 'go' to start update.", latest_version);
+    } else {
+        LOG_I("No new firmware version available.");
+    }
+}
+MSH_CMD_EXPORT(dfu_pan_check_dynamic_xz_cmd, Check for new firmware version with dynamic chip_id);

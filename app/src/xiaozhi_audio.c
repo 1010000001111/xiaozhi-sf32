@@ -831,9 +831,8 @@ void xz_audio_decoder_encoder_open(uint8_t is_websocket)
         thiz->mic = audio_open(AUDIO_TYPE_LOCAL_MUSIC, AUDIO_TXRX, &pa,
                                mic_callback, NULL);
         RT_ASSERT(thiz->mic);
-#if PKG_XIAOZHI_USING_AEC
+
         mic_gain_decrease(4);
-#endif
 
         thiz->speaker = thiz->mic;
         thiz->is_rx_enable = 1;   //麦克风常开
@@ -956,6 +955,18 @@ void xz_audio_decoder_encoder_close(void)
     thiz->inited = 0;
 
     rt_kprintf("xz_audio_decoder_encoder close out ok\n");
+}
+
+void reinit_audio()
+{
+    xz_audio_t *thiz = &xz_audio;
+    xz_aec_mic_close(thiz);
+    xz_speaker_close(thiz);
+    xz_audio_decoder_encoder_close();
+    // 重新打开音频解码器和编码器
+    xz_audio_decoder_encoder_open(1); 
+    xz_aec_mic_open(thiz);
+    xz_speaker_open(thiz);
 }
 
 void xz_audio_downlink(uint8_t *data, uint32_t size, uint32_t *aes_value,

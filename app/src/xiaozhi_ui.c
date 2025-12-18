@@ -26,6 +26,8 @@
 #include "../kws/app_recorder_process.h"
 #include "../board/board_hardware.h"
 #include "xiaozhi_screen.h"
+#include "charge.h"
+#include "bt_pan_ota.h"
 
 #define UPDATE_REAL_WEATHER_AND_TIME 11
 #define LCD_DEVICE_NAME "lcd"
@@ -42,7 +44,6 @@
 #define BRT_TB_SIZE     (sizeof(brigtness_tb)/sizeof(brigtness_tb[0]))
 #define BASE_WIDTH 390
 #define BASE_HEIGHT 450
-#define VERSION "V1.3.5"
 // 默认oled电池图标尺寸
 #define OUTLINE_W 58
 #define OUTLINE_H 33
@@ -73,7 +74,11 @@ typedef enum {
     UI_MSG_STANDBY_CHAT_OUTPUT,
     UI_MSG_VOLUME_UPDATE,  //更新下拉菜单里面的音量进度条
     UI_MSG_BRIGHTNESS_UPDATE,  //更新下拉菜单里面的亮度进度条
-    UI_MSG_CHARGE_STATUS_CHANGED
+    UI_MSG_CHARGE_STATUS_CHANGED,
+    UI_MSG_SHOW_UPDATE_CONFIRM,
+    UI_MSG_UPDATE_LATEST_VERSION,
+    UI_MSG_CONFIRM_BUTTON_EVENT,
+    UI_MSG_REINIT_AUDIO  
 
 } ui_msg_type_t;
 
@@ -96,7 +101,9 @@ static uint32_t anim_tick = 0;
 static rt_device_t lcd_device;
 static lv_obj_t* charging_icon = NULL;
 static lv_obj_t* standby_charging_icon = NULL;
-static rt_timer_t charge_detect_timer = RT_NULL; 
+static volatile uint8_t g_charge_status_isr_pending = 0;
+static volatile uint8_t g_charge_status_isr_value = 0;
+
 
 lv_obj_t *cont = NULL;
 lv_timer_t *ui_sleep_timer = NULL;
@@ -125,14 +132,15 @@ extern date_time_t g_current_time;
 extern rt_mailbox_t g_bt_app_mb;
 extern const unsigned char droid_sans_fallback_font[];
 extern const int droid_sans_fallback_font_size;
-extern uint8_t shutdown_state;
+extern bool shutdown_state;
 extern lv_obj_t *shutdown_screen; 
 extern lv_obj_t *sleep_screen;
 extern lv_obj_t *low_battery_shutdown_screen;
 extern lv_obj_t *low_battery_warning_screen;
 extern lv_obj_t *g_startup_screen;
 extern bool g_skip_startup; 
-
+extern bool lowpower_shutdown_state;
+extern bool g_low_power_mode;
 
 static struct rt_semaphore update_ui_sema;
 
@@ -145,6 +153,7 @@ static lv_style_t style_battery;
 static lv_obj_t* volume_slider = NULL;
 static lv_obj_t* brightness_lines = NULL;
 
+static lv_obj_t* update_switch = NULL;
 /*缩放因子*/
 static float g_scale = 1.0f;
 
@@ -237,6 +246,14 @@ static int g_battery_level = 60;        // 默认为满电
 static lv_obj_t *g_battery_fill = NULL;  // 电池填充对象
 static lv_obj_t *g_battery_label = NULL; // 电量标签
 
+// 更新确认弹框
+lv_obj_t *update_confirm_popup = NULL;
+static lv_obj_t *update_confirm_label = NULL;
+lv_obj_t *update_button = NULL;
+lv_obj_t *cancel_button = NULL;
+// 最新版本标签
+static lv_obj_t *latest_version_label = NULL;
+char latest_version[32] = {0};
 
 // 缩放因子计算
 float get_scale_factor(void)
@@ -251,63 +268,31 @@ float get_scale_factor(void)
     return (scale_x < scale_y) ? scale_x : scale_y;
 }
 
-static void charge_detect_handler(void *parameter)
+static rt_err_t charger_event_callback(rt_device_t dev, rt_size_t size)
 {
-    rt_uint8_t current_status;
-    static int last_battery_level = -1;  // 记录上次的电量，初始化为-1确保第一次会更新
-    
-    current_status = rt_pin_read(CHARGE_DETECT_PIN);
-    
-    // 检查状态是否发生变化，或者电量在100%临界值发生变化
-    bool status_changed = (current_status != last_charge_status);
-    bool battery_critical_change = (last_battery_level < 100 && g_battery_level >= 100) || 
-                                  (last_battery_level >= 100 && g_battery_level < 100);
-
-    if (status_changed || battery_critical_change) 
+   rt_kprintf("charger event callback\n");
+    if (size == RT_CHARGE_EVENT_DETECT)
     {
-        last_charge_status = current_status;
-        last_battery_level = g_battery_level;
-        
-        if (current_status == PIN_HIGH) 
-        {
-            xiaozhi_ui_update_charge_status(PIN_HIGH);
-        } 
-        else 
-        {
-            xiaozhi_ui_update_charge_status(PIN_LOW);
-        }
+        /* 由于中断回调不能直接malloc 内存，所以只能通过全局变量的方式保存状态 */
+        rt_uint8_t status = rt_pin_read(CHARGE_DETECT_PIN);
+        g_charge_status_isr_value = status;
+        g_charge_status_isr_pending = 1;
+    }
+    return RT_EOK;
+}
+static void set_charge_icon()
+{
+    rt_uint8_t current_charge_status;
+    rt_err_t err = rt_charge_get_detect_status(&current_charge_status);
+    if (err == RT_EOK) 
+    {
+        xiaozhi_ui_update_charge_status(current_charge_status);
     } 
     else 
     {
-        // 更新电量记录
-        last_battery_level = g_battery_level;
+       rt_kprintf("Failed to get charge detect status\n");
     }
 }
-static int charge_detect_init(void)
-{
-    rt_pin_mode(CHARGE_DETECT_PIN, PIN_MODE_INPUT);  
-    last_charge_status = rt_pin_read(CHARGE_DETECT_PIN);
-    charge_detect_timer  = rt_timer_create("charge_detect", 
-                                          charge_detect_handler,
-                                          RT_NULL,
-                                          rt_tick_from_millisecond(800),
-                                          RT_TIMER_FLAG_PERIODIC | RT_TIMER_FLAG_SOFT_TIMER);
-    
-    if (charge_detect_timer != RT_NULL) 
-    {
-        rt_timer_start(charge_detect_timer);
-        xiaozhi_ui_update_charge_status(last_charge_status);
-        rt_kprintf("Charge detection initialized on PA44\n");
-        return 0;
-    } else 
-    {
-        rt_kprintf("Failed to create charge detection timer\n");
-        return -1;
-    }
-}
-
-
-
 void ctrl_wakeup(bool is_wakeup)
 {
     if (wakeup_switch != NULL) 
@@ -618,7 +603,34 @@ static lv_obj_t* create_lines(lv_obj_t* parent, lv_event_cb_t cb, uint8_t row, u
     return obj;
 }
 
+static lv_obj_t* create_button(lv_obj_t* parent, lv_event_cb_t cb, const char* text, uint8_t row, uint8_t col)
+{
+    lv_obj_t* btn = lv_btn_create(parent);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_set_grid_cell(btn, LV_GRID_ALIGN_STRETCH, col, 2,
+        LV_GRID_ALIGN_STRETCH, row, 1);
+    
+    // 设置按钮内边距，确保文本不会贴边
+    lv_obj_set_style_pad_all(btn, 10, 0);
+    lv_obj_set_style_pad_top(btn, 15, 0);
+    lv_obj_set_style_pad_bottom(btn, 15, 0);
+    
+         // 设置默认按钮颜色
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1976D2), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    lv_obj_t* label = lv_label_create(btn);
+    lv_obj_add_style(label, &style, 0);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);  // 允许文本换行
+    lv_obj_set_width(label, LV_PCT(100));  // 设置标签宽度为100%，以便换行生效
+    
+    // 将标签居中放置在按钮内
+    lv_obj_center(label);
+    
+    return btn;
+}
 static void cont_event_handler(struct lv_event_t* e)
 {
     lv_obj_t* cont = lv_event_get_current_target_obj(e);
@@ -705,6 +717,110 @@ static void line_event_handler(struct _lv_event_t* e)
     xz_set_lcd_brightness(brigtness_tb[idx]);
 }
 
+void xiaozhi_ui_update_confirm_popup(ui_msg_type_t type, BOOL needs_update);
+
+static void update_switch_event_handler(struct _lv_event_t* e)
+{
+    // 获取按钮和标签对象
+    lv_obj_t* btn = lv_event_get_target(e);
+    lv_obj_t* label = lv_obj_get_child(btn, 0);
+
+        // 添加空指针检查
+    if (btn == RT_NULL || label == RT_NULL) {
+        LOG_E("Button or label is NULL");
+        return;
+    }
+
+    // 获取按钮当前的文本
+    const char* current_text = lv_label_get_text(label);
+    
+    // 如果当前是"检查更新状态，执行检查更新操作
+    if (strcmp(current_text, "检查更新") == 0) {
+        lv_obj_set_style_bg_color(update_switch, lv_color_hex(0x90EE90), LV_PART_MAIN | LV_STATE_DEFAULT);
+        // 调用OTA检查版本函数
+        // 构建动态URL
+        char* chip_id = get_client_id();
+        char* dynamic_ota_url = build_ota_query_url(chip_id);
+        int result = dfu_pan_query_latest_version(
+            dynamic_ota_url, VERSION, latest_version, sizeof(latest_version));
+        // 根据返回值判断是否有更新
+        BOOL needs_update = (result > 0) ? RT_TRUE : RT_FALSE;
+        LOG_D("OTA check result: %d", result);
+        //发送消息，显示弹框，根据是否需要更新显示按钮
+        xiaozhi_ui_update_confirm_popup(UI_MSG_SHOW_UPDATE_CONFIRM, needs_update);
+
+        
+    }
+   
+}
+// 添加弹框按钮事件处理函数
+static void update_confirm_button_event_handler(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    if (code == LV_EVENT_CLICKED) {
+        // 获取按钮上的标签文本
+        lv_obj_t *label = lv_obj_get_child(btn, 0);
+        const char *button_text = lv_label_get_text(label);
+        
+        if (strcmp(button_text, "更新") == 0) {
+            // 用户点击更新按钮
+            LOG_I("User confirmed OTA update");
+            
+            // 隐藏弹框
+            if (update_confirm_popup) {
+                lv_obj_add_flag(update_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+            }
+            // 在这里设置更新标志位
+            if (dfu_pan_set_update_flags() != 0)
+            {
+                LOG_E("Failed to mark versions for update");
+                return;
+            }
+
+            // 执行OTA更新流程
+            // 检查是否有需要更新的文件
+            BOOL needs_update = RT_FALSE;
+            for (int i = 0; i < MAX_FIRMWARE_FILES; i++)
+            {
+                struct firmware_file_info temp_version;
+                if (dfu_pan_get_firmware_file_info(i, &temp_version) == 0 &&
+                    temp_version.needs_update)
+                {
+                    needs_update = RT_TRUE;
+                    break;
+                }
+            }
+            
+            if (!needs_update) {
+                LOG_I("No firmware files need update.");
+                xiaozhi_ui_chat_output("没有需要更新的固件");
+                xiaozhi_ui_standby_chat_output("无需更新");
+                return;
+            }
+            
+            LOG_I("System will reboot to OTA mode...");
+            
+            // 延迟一段时间确保消息显示
+            rt_thread_mdelay(2000);
+            
+            // 重启系统
+            HAL_PMU_Reboot();
+        }
+        else if (strcmp(button_text, "取消") == 0) {
+            // 用户点击取消按钮
+            LOG_I("User cancelled OTA update");
+            //将下滑菜单按钮恢复颜色
+            lv_obj_set_style_bg_color(update_switch, lv_color_hex(0x1976D2), LV_PART_MAIN);
+
+            // 隐藏弹框
+            if (update_confirm_popup) {
+                lv_obj_add_flag(update_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+}
 
 rt_err_t xiaozhi_ui_obj_init()
 {
@@ -1066,7 +1182,7 @@ rt_err_t xiaozhi_ui_obj_init()
     row_dsc[3] = row_dsc[4] = CONT_H_PER(8);   // 第3、4行：各8%高度
     row_dsc[5] = CONT_H_PER(8);     // 第5行：8%高度
     row_dsc[6] = CONT_H_PER(8);     // 第6行：8%高度，用于版本号
-
+    row_dsc[7] = CONT_H_PER(8);               // 第7行：8%高度，用于新版本号
     cont = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(cont);
     lv_obj_set_style_grid_column_dsc_array(cont, col_dsc, 0);
@@ -1090,8 +1206,53 @@ rt_err_t xiaozhi_ui_obj_init()
     volume_slider = create_slider(cont, slider_event_handler, 3, 1, VOL_MIN_LEVEL, VOL_MAX_LEVEL, VOL_DEFAULE_LEVEL);
     create_tip_label(cont, "亮度", 4, 0);
     brightness_lines = create_lines(cont, line_event_handler, 4, 1, BRT_TB_SIZE, LCD_BRIGHTNESS_DEFAULT);
+    create_tip_label(cont, "检查更新" ,5, 0);
+    update_switch = create_button(cont, update_switch_event_handler, "检查更新", 5, 2);
     create_tip_label(cont, VERSION, 6, 2);
+    create_tip_label(cont, "版本号:", 6, 0);
+    create_tip_label(cont, "新版本:", 7, 1);
+    latest_version_label = create_tip_label(cont, latest_version, 7, 2);
 
+// 创建弹框（初始隐藏）
+    update_confirm_popup = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(update_confirm_popup, 300, 200);
+    lv_obj_center(update_confirm_popup);
+    lv_obj_set_style_bg_color(update_confirm_popup, lv_color_hex(0x202020), 0);
+    lv_obj_set_style_border_color(update_confirm_popup, lv_color_hex(0x00a0ff), 0);
+    lv_obj_set_style_border_width(update_confirm_popup, 2, 0);
+    lv_obj_set_style_radius(update_confirm_popup, 10, 0);
+    lv_obj_add_flag(update_confirm_popup, LV_OBJ_FLAG_HIDDEN); // 初始隐藏
+
+    // 创建提示文本
+    update_confirm_label = lv_label_create(update_confirm_popup);
+    lv_label_set_text(update_confirm_label, "提示");
+    lv_obj_align(update_confirm_label, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_set_style_text_color(update_confirm_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_style(update_confirm_label, &style, 0);
+
+    // 创建更新按钮
+    update_button = lv_button_create(update_confirm_popup);
+    lv_obj_set_size(update_button, 100, 40);
+    lv_obj_align(update_button, LV_ALIGN_BOTTOM_MID, -60, -20);
+    lv_obj_add_event_cb(update_button, update_confirm_button_event_handler, LV_EVENT_CLICKED, NULL);
+
+    // 创建更新按钮文本
+    lv_obj_t *update_button_label = lv_label_create(update_button);
+    lv_label_set_text(update_button_label, "更新");
+    lv_obj_center(update_button_label);
+    lv_obj_add_style(update_button_label, &style, 0);
+
+    // 创建取消按钮
+    cancel_button = lv_button_create(update_confirm_popup);
+    lv_obj_set_size(cancel_button, 100, 40);
+    lv_obj_align(cancel_button, LV_ALIGN_BOTTOM_MID, 60, -20);
+    lv_obj_add_event_cb(cancel_button, update_confirm_button_event_handler, LV_EVENT_CLICKED, NULL);
+    
+    // 创建取消按钮文本
+    lv_obj_t *cancel_button_label = lv_label_create(cancel_button);
+    lv_label_set_text(cancel_button_label, "取消");
+    lv_obj_center(cancel_button_label);
+    lv_obj_add_style(cancel_button_label, &style, 0);
 
 /*------------------电池---------------------*/
     g_battery_fill = lv_obj_create(battery_outline);
@@ -1118,11 +1279,12 @@ rt_err_t xiaozhi_ui_obj_init()
     lv_obj_align(g_battery_label, LV_ALIGN_CENTER, 0, 0);
     
  //充电图标       
-    charging_icon = lv_img_create(header_row);
+    // charging_icon = lv_img_create(header_row); // 原来是在header_row
+    charging_icon = lv_img_create(battery_outline); // 改为在电池框内
     lv_img_set_src(charging_icon, &cdian2);
     lv_obj_set_size(charging_icon, 32, 32);
     lv_obj_add_flag(charging_icon, LV_OBJ_FLAG_HIDDEN); // 初始隐藏
-    lv_obj_align_to(charging_icon, battery_outline, LV_ALIGN_OUT_LEFT_MID, 0, 0);
+    lv_obj_align(charging_icon, LV_ALIGN_RIGHT_MID, 8, 0); // 电池框左侧，稍微有点间距
 
     // 插入右侧空白对象用于对称布局
     lv_obj_t *spacer_right = lv_obj_create(header_row);
@@ -1384,6 +1546,21 @@ void xiaozhi_ui_chat_status(char *string) // top text
     }
 }
 
+void xiaozhi_ui_reinit_audio(void)
+{
+    if (ui_msg_queue != RT_NULL) {
+        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
+        if (msg != RT_NULL) {
+            msg->type = UI_MSG_REINIT_AUDIO;
+            msg->data = RT_NULL;
+            if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) 
+            {
+                LOG_E("Failed to send reinit audio UI message");
+                rt_free(msg);
+            }
+        }
+    }
+}
 
 void xiaozhi_ui_standby_chat_output(char *string)
 {
@@ -1489,6 +1666,86 @@ void xiaozhi_ui_update_ble(char *string) // ble
     }
 }
 
+// 更新确认弹框的函数
+void xiaozhi_ui_update_confirm_popup(ui_msg_type_t type, BOOL needs_update)
+{
+    if (ui_msg_queue != RT_NULL) {
+        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
+        if (msg != RT_NULL) {
+            msg->type = type;
+            if (type == UI_MSG_SHOW_UPDATE_CONFIRM) {
+                msg->data = (char*)rt_malloc(sizeof(BOOL));
+                if (msg->data != RT_NULL) {
+                    *((BOOL*)msg->data) = needs_update;
+                    if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
+                        LOG_E("Failed to send show update confirm UI message");
+                        rt_free(msg->data);
+                        rt_free(msg);
+                    }
+                } else {
+                    rt_free(msg);
+                }
+            } else {
+                msg->data = RT_NULL;
+                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
+                    LOG_E("Failed to send UI message");
+                    rt_free(msg);
+                }
+            }
+        }
+    }
+}
+// 更新最新版本号显示的函数
+void xiaozhi_ui_update_latest_version(char *version)
+{
+    if (ui_msg_queue != RT_NULL)
+    {
+        ui_msg_t *msg = (ui_msg_t *)rt_malloc(sizeof(ui_msg_t));
+        if (msg != RT_NULL)
+        {
+            msg->type = UI_MSG_UPDATE_LATEST_VERSION;
+            msg->data = ui_strdup(version);
+            if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t *)) != RT_EOK)
+            {
+                LOG_E("Failed to send update latest version UI message");
+                rt_free(msg->data);
+                rt_free(msg);
+            }
+        }
+    }
+}
+
+// 用于发送模拟按钮更新确认弹框按钮事件的UI消息
+void xiaozhi_ui_update_confirm_button_event(bool is_update_button)
+{
+    if (ui_msg_queue != RT_NULL)
+    {
+        ui_msg_t *msg = (ui_msg_t *)rt_malloc(sizeof(ui_msg_t));
+        if (msg != RT_NULL)
+        {
+            msg->type = UI_MSG_CONFIRM_BUTTON_EVENT;
+            // 使用 data 字段存储按钮类型信息：1表示更新按钮，0表示取消按钮
+            msg->data = (char *)rt_malloc(sizeof(bool));
+            if (msg->data != RT_NULL)
+            {
+                memcpy(msg->data, &is_update_button, sizeof(bool));
+                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t *)) !=
+                    RT_EOK)
+                {
+                    LOG_E("Failed to send update confirm button event UI "
+                          "message");
+                    rt_free(msg->data);
+                    rt_free(msg);
+                }
+            }
+            else
+            {
+                rt_free(msg);
+            }
+        }
+    }
+}
+
 static void pm_event_handler(gui_pm_event_type_t event)
 {
     LOG_I("in pm_event_handle");
@@ -1499,22 +1756,13 @@ static void pm_event_handler(gui_pm_event_type_t event)
     {
         LOG_I("in GUI_PM_EVT_SUSPEND");
         lv_timer_enable(false);
-        // 停止充电检测定时器
-        if (charge_detect_timer != RT_NULL) 
-        {
-            rt_timer_stop(charge_detect_timer);
-            rt_kprintf("Charge detect timer stopped\n");
-        }
+        g_low_power_mode = true;
         break;
     }
     case GUI_PM_EVT_RESUME:
     {
-        // 重新启动充电检测定时器
-        if (charge_detect_timer != RT_NULL) 
-        {
-            rt_timer_start(charge_detect_timer);
-            rt_kprintf("Charge detect timer restarted\n");
-        }
+        
+        g_low_power_mode = false;
 
         if(update_time_ui_timer)
         {
@@ -1533,11 +1781,12 @@ static void pm_event_handler(gui_pm_event_type_t event)
             lv_timer_delete(ui_sleep_timer);
             ui_sleep_timer = NULL;
         }
-        if (shutdown_state) //如果是关机消息触发的唤醒，就不再切换到对话界面去了
+        if (shutdown_state && lowpower_shutdown_state) //如果是关机消息触发的唤醒，就不再切换到对话界面去了
         {
             rt_kprintf("恢复屏幕-> 对话\n");
             ui_switch_to_xiaozhi_screen();
-            shutdown_state = 1;
+            shutdown_state = TRUE;
+            lowpower_shutdown_state = TRUE;
         }
         if (!thiz->vad_enabled)
         {
@@ -1753,8 +2002,9 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
     {
         return;
     }
-
-    charge_detect_init(); // 初始化充电检测
+    
+    rt_charge_set_rx_ind(charger_event_callback); // 初始化充电检测
+    set_charge_icon();
 
     xiaozhi_ui_update_ble("close");
     xiaozhi_ui_chat_status("连接中...");
@@ -1792,7 +2042,13 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
     {
         rt_uint32_t btn_event;
         rt_uint32_t ui_event;
-
+        //先处理充电消息
+        if (g_charge_status_isr_pending)
+        {
+            uint8_t v = g_charge_status_isr_value;
+            g_charge_status_isr_pending = 0;
+            xiaozhi_ui_update_charge_status(v);
+        }
         if (g_kws_force_exit)
         {
             g_kws_force_exit = 0;
@@ -1896,6 +2152,7 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     if (standby_screen) {
                         lv_screen_load(standby_screen);
                         lv_obj_set_parent(cont, lv_screen_active());
+                        lv_obj_set_parent(update_confirm_popup, lv_screen_active());
                         lv_obj_move_foreground(cont);
                         }
 
@@ -1938,6 +2195,7 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
 
                         lv_screen_load(lv_obj_get_screen(main_container));
                         lv_obj_set_parent(cont, lv_screen_active());
+                        lv_obj_set_parent(update_confirm_popup, lv_screen_active());
                         lv_obj_move_foreground(cont);
                     }
                     // mic开启，关闭KWS
@@ -2239,6 +2497,103 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                         
                     }
                     break;
+                case UI_MSG_SHOW_UPDATE_CONFIRM:
+                    if (msg->data)
+                    {
+                        BOOL needs_update = *((BOOL *)msg->data);
+                            LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM\n");
+
+                            // 显示弹框
+                        if (update_confirm_popup)
+                        {
+                                
+                            lv_obj_remove_flag(update_confirm_popup,
+                                            LV_OBJ_FLAG_HIDDEN);
+                            }
+                            
+                            // 根据是否有更新设置弹框内容
+                        if (needs_update)
+                        {
+                                LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM: needs_update\n");
+                                // 如果有新版本，显示更新提示和按钮
+                            if (update_confirm_label)
+                            {
+                                char update_text[32];
+                                snprintf(update_text, sizeof(update_text),
+                                        "发现新版本%s", latest_version);
+                                lv_label_set_text(update_confirm_label,
+                                                update_text);
+                                }
+                            if (update_button)
+                            {
+                                lv_obj_remove_flag(update_button,
+                                                LV_OBJ_FLAG_HIDDEN);
+                            }
+                        }
+                        else
+                        {
+                                LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM: no update\n");    
+                                // 如果没有新版本，显示无需更新提示并隐藏更新按钮
+                            if (update_confirm_label)
+                            {
+                                lv_label_set_text(update_confirm_label,
+                                                "当前已是最新版本");
+                                }
+                            if (update_button)
+                            {
+                                lv_obj_add_flag(update_button,
+                                                LV_OBJ_FLAG_HIDDEN); // 隐藏更新按钮
+                            }
+                        }
+                    }
+                    break;
+                case UI_MSG_UPDATE_LATEST_VERSION:
+                    if (msg->data && latest_version_label)
+                    {
+                        lv_label_set_text(latest_version_label, msg->data);
+
+                        // 显示版本提示弹框
+                        if (update_confirm_popup)
+                        {
+                            char update_text[32];
+                            snprintf(update_text, sizeof(update_text),
+                                    "发现新版本%s", msg->data);
+                            lv_label_set_text(update_confirm_label, update_text);
+                            lv_obj_remove_flag(update_confirm_popup,
+                                            LV_OBJ_FLAG_HIDDEN);
+                        }
+                    }
+                    break;
+                case UI_MSG_REINIT_AUDIO:
+                    rt_kprintf("UI thread: reinitializing audio\n");
+                    reinit_audio();
+                    break;
+                case UI_MSG_CONFIRM_BUTTON_EVENT: 
+                    // 从消息数据中获取按钮类型
+                    BOOL is_update_button = *(BOOL *)msg->data;
+                    // 检查弹框是否已创建且可见
+                    if (update_confirm_popup && !lv_obj_has_flag(update_confirm_popup, LV_OBJ_FLAG_HIDDEN))
+                    {
+                        if (is_update_button)
+                        {
+                            // 模拟点击更新按钮
+                            if (update_button &&
+                                !lv_obj_has_flag(update_button, LV_OBJ_FLAG_HIDDEN))
+                            {
+                                lv_obj_send_event(update_button, LV_EVENT_CLICKED, NULL);
+                            }
+                        }
+                        else
+                        {
+                            // 模拟点击取消按钮
+                            if (cancel_button)
+                            {
+                                lv_obj_send_event(cancel_button, LV_EVENT_CLICKED,
+                                                NULL);
+                            }
+                        }
+                    }
+                    break;
             }
             // 释放消息内存
             ui_free(msg->data);
@@ -2310,9 +2665,6 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                 }
                 last_listen_tick = 0;
             }
-
-#ifdef BSP_USING_PM
-
             if (gui_is_force_close())
             {
                 LOG_I("in force_close");
@@ -2330,7 +2682,6 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     lv_display_trigger_activity(NULL);
                 }
             }
-#endif // BSP_USING_PM
 
             rt_thread_mdelay(ms);
             rt_sem_release(&update_ui_sema);
