@@ -6,7 +6,7 @@
     #define GET_URL_LEN_MAX 256               // 网址最大长度
     #define GET_URI "http://%s/xiaozhi/ota/" // 获取小焯版本
     #define XIAOZHI_OTA_HOST "xzapi.ldfd.cc"
-    #define XIAOZHI_WS_HOST "wss.ldfs.cc"
+    #define XIAOZHI_WS_HOST "wss.ldfd.cc"
     #define XIAOZHI_WSPATH "/xiaozhi/v1/"
     #define XIAOZHI_TOKEN "Bearer 12345678"
 
