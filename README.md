@@ -8,7 +8,7 @@
 
 ## 源码构建
 
-如需自行编译和烧录固件，请参考[源码构建文档](https://docs.sifli.com/projects/xiaozhi/source-build/)。
+如需自行编译和烧写固件，请参考[源码构建文档](https://docs.sifli.com/projects/xiaozhi/source-build/)。
 
 ## 支持硬件
 
