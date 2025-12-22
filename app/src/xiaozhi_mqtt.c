@@ -202,7 +202,7 @@ void my_mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len,
         BT_NOTIFY_LINK_POLICY_ROLE_SWITCH); // close role switch
 
         mqtt_listen_start(&g_xz_context, kListeningModeAlwaysOn);
-        xiaozhi_ui_chat_output("小智 已连接!");
+        xiaozhi_ui_chat_output("小焯 已连接!");
         xiaozhi_ui_update_ble("open");
         xiaozhi_ui_chat_status("待命中...");
         xiaozhi_ui_update_emoji("neutral");

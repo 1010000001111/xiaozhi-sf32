@@ -898,7 +898,7 @@ int main(void)
                 xiaozhi_ui_update_latest_version(latest_version);
             } 
 
-            xiaozhi_ui_standby_chat_output("请按键连接小智...");
+            xiaozhi_ui_standby_chat_output("请按键连接小焯...");
             lv_display_trigger_activity(NULL);
 
 #ifdef XIAOZHI_USING_MQTT
@@ -926,7 +926,7 @@ int main(void)
         else if (value == WEBSOC_RECONNECT) // Reconnect Xiaozhi websocket
         {
 
-                        xiaozhi2(0,NULL); // 重连小智websocket
+                        xiaozhi2(0,NULL); // 重连小焯websocket
        } 
         else if(value == BT_APP_PHONE_DISCONNECTED)
         {
