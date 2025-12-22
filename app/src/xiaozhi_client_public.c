@@ -191,7 +191,7 @@ static void svr_found_callback(const char *name, const ip_addr_t *ipaddr,
 int check_internet_access()
 {
     int r = 0;
-    const char *hostname = XIAOZHI_HOST;
+    const char *hostname = XIAOZHI_OTA_HOST;
     ip_addr_t addr = {0};
 
     {
