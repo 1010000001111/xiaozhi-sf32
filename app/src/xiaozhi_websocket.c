@@ -681,12 +681,12 @@ void xiaozhi_ws_connect(void)
         if (g_xz_ws.sem == NULL)
             g_xz_ws.sem = rt_sem_create("xz_ws", 0, RT_IPC_FLAG_FIFO);
 
-        wsock_init(&g_xz_ws.clnt, 1, 1,
+        wsock_init(&g_xz_ws.clnt, 0, 1,
                    my_wsapp_fn); // 初始化websocket,注册回调函数
         char *Client_Id = get_client_id();
         err = wsock_connect(
             &g_xz_ws.clnt, MAX_WSOCK_HDR_LEN, XIAOZHI_HOST, XIAOZHI_WSPATH,
-            LWIP_IANA_PORT_HTTPS, XIAOZHI_TOKEN, NULL,
+            LWIP_IANA_PORT_HTTP, XIAOZHI_TOKEN, NULL,
             "Protocol-Version: 1\r\nDevice-Id: %s\r\nClient-Id: %s\r\n",
             get_mac_address(), Client_Id);
         rt_kprintf("Web socket connection %d\r\n", err);
