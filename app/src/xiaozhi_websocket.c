@@ -865,7 +865,7 @@ void xiaozhi2(int argc, char **argv)
                     she_bei_ma = 0;
                     char str_temp[256];
                     snprintf(str_temp, sizeof(str_temp),
-                            "设备未添加，请前往 xiaozhi.me "
+                            "设备未添加，请前往 xz.ldfd.cc "
                             "输入绑定码: \n %s \n ",
                             g_activation_context.code);
                     xiaozhi_ui_chat_output(str_temp);
