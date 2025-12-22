@@ -243,7 +243,7 @@ char *get_xiaozhi()
         goto __exit;
     }
     /* 拼接 GET 网址 */
-    rt_snprintf(xiaozhi_url, GET_URL_LEN_MAX, GET_URI, XIAOZHI_HOST);
+    rt_snprintf(xiaozhi_url, GET_URL_LEN_MAX, GET_URI, XIAOZHI_OTA_HOST);
 
     /* 创建会话并且设置响应的大小 */
     session = webclient_session_create(GET_HEADER_BUFSZ);

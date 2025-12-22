@@ -685,7 +685,7 @@ void xiaozhi_ws_connect(void)
                    my_wsapp_fn); // 初始化websocket,注册回调函数
         char *Client_Id = get_client_id();
         err = wsock_connect(
-            &g_xz_ws.clnt, MAX_WSOCK_HDR_LEN, XIAOZHI_HOST, XIAOZHI_WSPATH,
+            &g_xz_ws.clnt, MAX_WSOCK_HDR_LEN, XIAOZHI_WS_HOST, XIAOZHI_WSPATH,
             LWIP_IANA_PORT_HTTP, XIAOZHI_TOKEN, NULL,
             "Protocol-Version: 1\r\nDevice-Id: %s\r\nClient-Id: %s\r\n",
             get_mac_address(), Client_Id);
